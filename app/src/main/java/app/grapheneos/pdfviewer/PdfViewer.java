@@ -14,7 +14,6 @@ import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
-import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
@@ -30,31 +29,30 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.graphics.Insets;
-import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
+import androidx.fragment.app.FragmentTransaction;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.loader.app.LoaderManager;
 import androidx.loader.content.Loader;
 
 import com.google.android.material.snackbar.Snackbar;
 
-import app.grapheneos.pdfviewer.databinding.PdfviewerBinding;
-import app.grapheneos.pdfviewer.fragment.DocumentPropertiesFragment;
-import app.grapheneos.pdfviewer.fragment.PasswordPromptFragment;
-import app.grapheneos.pdfviewer.fragment.JumpToPageFragment;
-import app.grapheneos.pdfviewer.ktx.ViewKt;
-import app.grapheneos.pdfviewer.loader.DocumentPropertiesAsyncTaskLoader;
-import app.grapheneos.pdfviewer.viewModel.PasswordStatus;
-
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.FileNotFoundException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+
+import app.grapheneos.pdfviewer.databinding.PdfviewerBinding;
+import app.grapheneos.pdfviewer.fragment.DocumentPropertiesFragment;
+import app.grapheneos.pdfviewer.fragment.JumpToPageFragment;
+import app.grapheneos.pdfviewer.fragment.PasswordPromptFragment;
+import app.grapheneos.pdfviewer.ktx.ViewKt;
+import app.grapheneos.pdfviewer.loader.DocumentPropertiesAsyncTaskLoader;
+import app.grapheneos.pdfviewer.outline.OutlineFragment;
+import app.grapheneos.pdfviewer.viewModel.PdfViewModel;
 
 public class PdfViewer extends AppCompatActivity implements LoaderManager.LoaderCallbacks<List<CharSequence>> {
     public static final String TAG = "PdfViewer";
@@ -134,7 +132,7 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
     private Toast mToast;
     private Snackbar snackbar;
     private PasswordPromptFragment mPasswordPromptFragment;
-    public PasswordStatus passwordValidationViewModel;
+    public PdfViewModel viewModel;
 
     private final ActivityResultLauncher<Intent> openDocumentLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(), result -> {
@@ -146,6 +144,7 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
                     mPage = 1;
                     mDocumentProperties = null;
                     mEncryptedDocumentPassword = "";
+                    viewModel.clearOutline();
                     loadPdf();
                     invalidateOptionsMenu();
                 }
@@ -165,6 +164,11 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
             });
 
     private class Channel {
+        @JavascriptInterface
+        public void setDocumentOutline(final String outline) {
+            viewModel.parseOutlineString(outline);
+        }
+
         @JavascriptInterface
         public int getPage() {
             return mPage;
@@ -232,17 +236,17 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
             if (!getPasswordPromptFragment().isAdded()){
                 getPasswordPromptFragment().show(getSupportFragmentManager(), PasswordPromptFragment.class.getName());
             }
-            passwordValidationViewModel.passwordMissing();
+            viewModel.passwordMissing();
         }
 
         @JavascriptInterface
         public void invalidPassword() {
-            runOnUiThread(() -> passwordValidationViewModel.invalid());
+            runOnUiThread(() -> viewModel.invalid());
         }
 
         @JavascriptInterface
         public void onLoaded() {
-            passwordValidationViewModel.validated();
+            viewModel.validated();
             if (getPasswordPromptFragment().isAdded()) {
                 getPasswordPromptFragment().dismiss();
             }
@@ -261,20 +265,33 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
         binding = PdfviewerBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
         setSupportActionBar(binding.toolbar);
-        passwordValidationViewModel = new ViewModelProvider(this, ViewModelProvider.AndroidViewModelFactory.getInstance(getApplication())).get(PasswordStatus.class);
+        viewModel = new ViewModelProvider(this, ViewModelProvider.AndroidViewModelFactory.getInstance(getApplication())).get(PdfViewModel.class);
+
+        viewModel.getOutline().observe(this, requested -> {
+            if (requested instanceof PdfViewModel.OutlineStatus.Requested) {
+                viewModel.setLoadingOutline();
+                binding.webview.evaluateJavascript("getDocumentOutline()", null);
+            }
+        });
+
+
+        getSupportFragmentManager().setFragmentResultListener(OutlineFragment.RESULT_KEY, this,
+                (requestKey, result) -> {
+            final int newPage = result.getInt(OutlineFragment.PAGE_KEY, -1);
+            if (viewModel.shouldAbortOutline()) {
+                Log.d(TAG, "aborting outline operations");
+                binding.webview.evaluateJavascript("abortDocumentOutline()", null);
+                viewModel.clearOutline();
+            } else {
+                onJumpToPageInDocument(newPage);
+            }
+        });
 
         EdgeToEdge.enable(this);
 
         // Margins for the toolbar are needed, so that content of the toolbar
         // is not covered by a system button navigation bar when in landscape.
-        ViewCompat.setOnApplyWindowInsetsListener(binding.toolbar, (v, windowInsets) -> {
-            Insets insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
-            ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) v.getLayoutParams();
-            mlp.leftMargin = insets.left;
-            mlp.rightMargin = insets.right;
-            v.setLayoutParams(mlp);
-            return windowInsets;
-        });
+        KtUtilsKt.applySystemBarMargins(binding.toolbar, false);
 
         binding.webview.setBackgroundColor(Color.TRANSPARENT);
 
@@ -445,6 +462,8 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
             loadPdf();
         }
     }
+
+
 
     @Override
     protected void onDestroy() {
@@ -659,7 +678,8 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
         final ArrayList<Integer> ids = new ArrayList<>(Arrays.asList(R.id.action_jump_to_page,
                 R.id.action_next, R.id.action_previous, R.id.action_first, R.id.action_last,
                 R.id.action_rotate_clockwise, R.id.action_rotate_counterclockwise,
-                R.id.action_view_document_properties, R.id.action_share, R.id.action_save_as));
+                R.id.action_view_document_properties, R.id.action_share, R.id.action_save_as,
+                R.id.action_outline));
         if (BuildConfig.DEBUG) {
             ids.add(R.id.debug_action_toggle_text_layer_visibility);
         }
@@ -712,6 +732,16 @@ public class PdfViewer extends AppCompatActivity implements LoaderManager.Loader
             return true;
         } else if (itemId == R.id.action_rotate_counterclockwise) {
             documentOrientationChanged(-90);
+            return true;
+        } else if (itemId == R.id.action_outline) {
+            OutlineFragment outlineFragment =
+                    OutlineFragment.newInstance(mPage, getCurrentDocumentName());
+            getSupportFragmentManager().beginTransaction()
+                    .setTransition(FragmentTransaction.TRANSIT_FRAGMENT_OPEN)
+                    // fullscreen fragment, since content root view == activity's root view
+                    .add(android.R.id.content, outlineFragment)
+                    .addToBackStack(null)
+                    .commit();
             return true;
         } else if (itemId == R.id.action_view_document_properties) {
             DocumentPropertiesFragment
